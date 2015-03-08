@@ -38,6 +38,8 @@ CONTAINER_PACKAGES=(
 IMAGE_PACKAGES=(
     'coreutils'  # binaries commonly used in scriptlets
     'shadow'
+    'zsh'
+    'grep'
 )
 
 _MOUNTS=()
@@ -234,7 +236,9 @@ build() {
 
     for script in $scripts; do
         msg "running script ${script}"
-        zsh ./$script $rootfs
+        cp $script $rootfs/tmp
+        chroot $rootfs zsh tmp/$script
+        rm $rootfs/tmp/$script
     done
 
     info "cleanup the image"

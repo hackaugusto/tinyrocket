@@ -1,0 +1,114 @@
+#!/usr/bin/zsh
+
+msg() {
+    # bold and green
+    printf "$(tput bold)$(tput setaf 2) $1$(tput sgr0)\n" >&1
+}
+
+info() {
+    # bold and blue
+    printf "$(tput bold)$(tput setaf 4) -> $1$(tput sgr0)\n" >&1
+}
+
+error () {
+    # bold and red
+    printf "$(tput bold)$(tput setaf 1) ERROR: $1$(tput sgr0)\n" >&1
+}
+
+die() {
+    error "$@"
+    exit 1
+}
+
+usage() {
+    (( $# )) && error $@
+    echo "usage: ${0} [-f] <rootaci> <newaci> <scripts>..."
+    exit
+}
+
+add_binary() {
+    [ $# -ne 1 ] && die "${0} needs one argument: ${0} <binary>"
+
+    binary=$1
+
+    cp $binary $ROOTFS/$binary
+
+    ldd $binary 2>/dev/null | grep '=>' | sed 's/^\t*//' | cut -d' ' -f3 | while read library; do
+        cp $library $ROOTFS/$library
+    done
+}
+
+hash actool 2>/dev/null
+if [ $? -ne 0 ]; then
+    die "actool is not installed"
+fi
+
+force=0
+tocopy=()
+while getopts "fb:" opt; do
+    case $opt in
+        b)
+            file=$OPTARG
+            [ ! -e $file ] && die "the file $file does not exists"
+            tocopy=("${tocopy[@]}" $file)
+            ;;
+        f)
+            force=1
+            ;;
+        \?)
+            usage "unknow argument $OPTARG"
+            ;;
+    esac
+done
+
+# shift optional args
+shift $(($OPTIND-1))
+
+[ $# -lt 3 ] && usage "needs at minimum three arguments"
+
+stage1=$1
+outputaci=$2
+
+[ -z $stage1 -o -z $outputaci ] && usage 'neither <rootaci> or <newaci> names can be empty'
+[ "$stage1" = "$outputaci" -a $force -ne 1 ] && usage 'the output image cannot have the same name (use -f to force)'
+[ -e "$outputaci" -a $force -ne 1 ] && usage 'the output image already exists (use -f to force)'
+shift 2
+
+WORKDIR=$(mktemp -d --suffix 'tinyrocket.tinybuild')
+ROOTFS=$WORKDIR/rootfs
+tar -xf $stage1 -C $WORKDIR
+
+deletetmp=0
+[ ! -d $ROOTFS/tmp ] && mkdir $ROOTFS/tmp && deletetmp=1
+
+for script in $@; do
+    [ ! -e $script ] && die "script $script does not exists"
+done
+
+msg "copying binaries: [$tocopy]"
+installed=()
+for file in $tocopy; do
+    [ -e $ROOTFS/$file ] && continue
+    add_binary $file
+done
+
+msg 'running scripts'
+for script in $@; do
+    cp $script $ROOTFS/tmp
+    info "running $script"
+    systemd-nspawn -D $ROOTFS bash tmp/$script
+    rm $ROOTFS/tmp/$script
+done
+
+info 'cleaning up'
+[ $deletetmp -eq 1 ] && rmdir $ROOTFS/tmp
+#for file in $installed; do
+#    rm $file
+#done
+
+info 'creating the image'
+if [ $force -eq 1 ]; then
+    actool build --overwrite $WORKDIR $outputaci
+else
+    actool build $WORKDIR $outputaci
+fi
