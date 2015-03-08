@@ -1,0 +1,373 @@
+#!/usr/bin/zsh
+
+# setopt ERR_EXIT
+
+PKGIGNORE=(
+    'jfsutils'
+    'lvm2'
+    'cryptsetup'
+    'groff'
+    'man-db'
+    'man-pages'
+    'mdadm'
+    'pciutils'
+    'pcmciautils'
+    'reiserfsprogs'
+    's-nail'
+    'xfsprogs'
+)
+
+CONTAINER_PACKAGES=(
+    'bzip2'
+    'dhcpcd'
+    'findutils'
+    'gzip'
+    'linux'
+    'pacman'
+    'python2'
+    'tar'
+    'util-linux'
+    'binutils'
+    'coreutils'
+    'systemd'
+    'filesystem'
+    'zsh'
+    'file'
+)
+
+IMAGE_PACKAGES=(
+    'coreutils'  # binaries commonly used in scriptlets
+    'shadow'
+)
+
+_MOUNTS=()
+
+msg() {
+    # bold and green
+    printf "$(tput bold)$(tput setaf 2) $1$(tput sgr0)\n" >&1
+}
+
+info() {
+    # bold and blue
+    printf "$(tput bold)$(tput setaf 4) -> $1$(tput sgr0)\n" >&1
+}
+
+error () {
+    # bold and red
+    printf "$(tput bold)$(tput setaf 1) ERROR: $1$(tput sgr0)\n" >&1
+}
+
+die() {
+    error "$@"
+    exit 1
+}
+
+usage() {
+    die "$0 [-f] [-m <manifest file>] (container|aci) <image_name> <package>..."
+}
+
+cleanup() {
+    msg "Cleaning up"
+    _umount
+    # _runasroot rm -rf "${WORKDIR}"
+}
+
+runasroot() {
+    if [ $UID -ne 0 ]; then
+        msg "running as root: '${*}'"
+    else
+        msg "running: '${*}'"
+    fi
+
+    if [ $noconfirm -eq 0 ]; then
+        read -q 'yesno?Should I proceed (y|N)? '
+        echo
+
+        if [ $yesno != 'y' -a $yesno != 'Y' ]; then
+            die 'aborting'
+        fi
+    fi
+
+    _runasroot $@
+}
+
+_runasroot() {
+    local _sudo
+
+    _sudo=
+    if [ $UID -ne 0 ]; then
+        _sudo=sudo
+    fi
+
+    $_sudo $@
+}
+
+_mount() {
+    # Utility for keeping track of mounted filesystems
+    [ ! -z ${_MOUNTS[(r)$2]} ] && return
+    mount "$@"
+    _MOUNTS=("$2" "${_MOUNTS[@]}")
+}
+
+_umount() {
+    # Utility to automatically umount filesystem
+    [ -z "$_MOUNTS[*]" ] && return
+    umount "${_MOUNTS[@]}"
+    _MOUNTS=()
+}
+
+mountpoints() {
+    local directory
+
+    [ $# -ne 1 ] && die "${0} requires an argument, $# supplied: ${0} [directory]"
+
+    directory=$1
+    _mount proc "${directory}/proc" -t proc -o nosuid,noexec,nodev
+    _mount sys "${directory}/sys" -t sysfs -o nosuid,noexec,nodev,ro
+    _mount udev "${directory}/dev" -t devtmpfs -o mode=0755,nosuid
+    _mount devpts "${directory}/dev/pts" -t devpts -o mode=0620,gid=5,nosuid,noexec
+    _mount shm "${directory}/dev/shm" -t tmpfs -o mode=1777,nosuid,nodev
+    _mount run "${directory}/run" -t tmpfs -o nosuid,nodev,mode=0755
+    _mount tmp "${directory}/tmp" -t tmpfs -o mode=1777,strictatime,nodev,nosuid
+}
+
+image_precleanup() {
+    local directory
+
+    [ $# -ne 1 ] && die "${0} requires an argument, the work directory"
+    [ $(realpath $1) = '/' ] && die "${0} cannot be /"
+
+    directory=$1
+    _runasroot rm -rf ${directory}/{var/lib/pacman,usr/include,usr/share/man,usr/share/doc,usr/share/terminfo}
+}
+
+verify_packages() {
+    pacman -Ql $@ > /dev/null
+    [ ! $? -eq 0 ] && die "Unknow packages"
+}
+
+verify_imagename() {
+    local image force
+
+    [ $# -ne 2 ] && die "${0} requires two arguments: ${0} [image name] [force]"
+
+    image=$1
+    force=$2
+
+    if [[ ! $image =~ '\.aci$' ]]; then
+        die "${image} must end with the '.aci' extension"
+    fi
+
+    if [ -e $image ]; then
+        if [ $force -eq 1 ]; then
+            msg "Removing file ${image}"
+            rm --force $image
+        else
+            die "File ${image} already exists"
+        fi
+    fi
+}
+
+verify_manifest() {
+    local manifest
+
+    [ $# -ne 1 ] && die "${0} requires one argument, $# informed: ${0} [manifest file]"
+
+    manifest=$1
+    [ ! -e $manifest ] && die "$manifest doesnt exists"
+
+
+    actool validate $manifest || die "${manifest} is invalid"
+}
+
+container() {
+    local container_directory
+    [ $# -lt 2 ] && die "${0} requires at least two arguments, $# given: ${0} [directory] [package]..."
+    [ ! -e $1 ] && die "${1} doesnt exists"
+    [ ! -d $1 ] && die "${1} should be a directory"
+
+    container_directory=$1
+    shift 1
+
+    msg "Setting up the container"
+
+    info "filesystem directories and mount points"
+    filesystem $container_directory
+
+    info "initializing the container"
+    if [ $UID -eq 0 ]; then
+        mountpoints $container_directory
+    else
+        error 'not running as super user, cannot mount inside the container'
+    fi
+    packages $container_directory $@
+    _umount
+
+    info "copying tinyrocket"
+    mkdir -p "${container_directory}/usr/bin/"
+
+    _runasroot cp /usr/bin/tinyrocket "${container_directory}/usr/bin/tinyrocket"
+    _runasroot cp /usr/bin/actool "${container_directory}/usr/bin/actool"
+}
+
+build() {
+    local packages_install directory rootfs image_name
+
+    [ $# -lt 4 ] && die "${0} requires at least four arguments, $# informed ($@): ${0} [directory] [image name] [scripts] [package]..."
+    [ -e $1 -a ! -d $1 ] && die "${1} should be a directory"
+    [ ! -e $1 ] && mkdir -p $1
+
+    directory=$1
+    rootfs="${directory}/rootfs"
+    image_name=$2
+    scripts=(${(s. .)3})
+    shift 3
+
+    msg "Starting the build"
+
+    info "filesystem directories"
+    filesystem $rootfs
+
+    packages_install="${@[*]}"
+    info "pacman [installing ${#@}: $packages_install]"
+    packages $rootfs $@
+
+    for script in $scripts; do
+        msg "running script ${script}"
+        zsh ./$script $rootfs
+    done
+
+    info "cleanup the image"
+    image_precleanup $rootfs
+
+    info "generating the aci"
+    image $directory $image_name
+}
+
+filesystem() {
+    local directory
+
+    [ ! $# -eq 1 ] && die "${0} requires an argument, the work directory"
+    directory=$1
+
+    mkdir -m 0755 -p "${directory}"/{var,dev,run,etc,boot,mnt,media,home}
+    mkdir -m 0755 -p "${directory}"/var/{cache,lib,log}
+    mkdir -m 0755 -p "${directory}"/var/{cache/pacman/pkg,lib/pacman,log} "${directory}"/{dev,run,etc,boot,mnt,media,home}
+    mkdir -m 1777 -p "${directory}"/tmp
+    mkdir -m 0555 -p "${directory}"/{sys,proc}
+}
+
+packages() {
+    local pkgignore directory packages
+
+    [ $# -lt 2 ] && die "${0} requires at least two arguments, $# informed: packages [directory] [packages]..."
+
+    directory=$1
+    shift 1
+
+    packages=($@)
+    pkgignore=()
+
+    for ignore in ${PKGIGNORE:|packages}; do
+        pkgignore=("${pkgignore[@]}" "--ignore" ${ignore})
+    done
+
+    runasroot pacman --root $directory --noconfirm --noprogressbar -Sy ${packages} ${pkgignore} || die "pacman failed"
+
+    [ ! $? -eq 0 ] && die "pacman failed"
+}
+
+image() {
+    local directory image_name
+
+    [ $# -ne 2 ] && die "${0} requires two arguments: ${0} [directory] [image name]"
+    directory=$1
+    image_name=$2
+
+    _runasroot tar --directory=$directory --xz -cf $image_name manifest rootfs
+    _runasroot chmod 644 $image_name
+}
+
+# [container|aci] [image name] [package]
+[ $# -lt 3 ] && error 'missing arguments' && usage
+
+force=0
+noconfirm=0
+manifest='manifest'
+
+scripts=()  # scripts to run before creating the .aci file
+
+while getopts "yfm:s:" opt; do
+    case $opt in
+        s)
+            script=$OPTARG;
+            [ ! -e $script ] && die "${script} does not exists"
+            scripts=("${scripts[@]}" $script)
+            ;;
+        m)
+            manifest=$OPTARG;
+            [ ! -e $manifest ] && die "${manifest} does not exists"
+            ;;
+        f)
+            force=1
+            ;;
+        y)
+            noconfirm=1
+            ;;
+        \?)
+            usage
+            ;;
+    esac
+done
+
+# shift optional args
+shift $(($OPTIND-1))
+
+command=$1
+image=$2
+shift 2
+all_packages=(${*})
+
+trap 'cleanup' EXIT
+
+hash actool 2>/dev/null
+if [ $? -ne 0 ]; then
+    die "actool is not installed"
+fi
+
+if [ $command = 'container' ]; then
+    verify_manifest $manifest
+    verify_imagename $image $force
+    verify_packages ${all_packages}
+
+    WORKDIR=$(mktemp -d --suffix 'tinyrocket.container')
+
+    container "$WORKDIR" $CONTAINER_PACKAGES
+
+    info 'coping files ...'
+    cp $manifest $WORKDIR/manifest
+
+    script_flag=()
+    for script in $scripts; do
+        cp $script $WORKDIR/$script
+        script_flag=("${script_flag[@]}" -s $script)
+    done
+
+    _runasroot systemd-nspawn -D "$WORKDIR" /usr/bin/tinyrocket aci ${script_flag} ${image} ${all_packages}
+    cp "${WORKDIR}"/$image ./$image
+
+elif [ $command = 'aci' ]; then
+    all_packages=($IMAGE_PACKAGES ${all_packages})
+
+    verify_manifest $manifest
+    verify_imagename $image $force
+    verify_packages ${all_packages}
+
+    WORKDIR=$(mktemp -d --suffix 'tinyrocket.aci')
+
+    cp $manifest $WORKDIR/manifest
+    build $WORKDIR $image "$scripts" $all_packages
+else
+    error 'command must be container or aci'
+    usage
+fi
