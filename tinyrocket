@@ -65,7 +65,7 @@ die() {
 }
 
 usage() {
-    die "$0 [-f] [-m <manifest file>] (container|aci|docker) <image_name> <package>..."
+    die "$0 [-f] [-m <manifest file>] [container] (rocket|docker) <image_name> <package>..."
 }
 
 cleanup() {
@@ -298,12 +298,13 @@ docker_image() {
     _runasroot tar --directory=$directory -cf $image_name .
 }
 
-# [container|rocket|docker] [image name] [package]
+# [rocket|docker] [image name] [package]
 [ $# -lt 3 ] && error 'missing arguments' && usage
 
 force=0
 noconfirm=0
 manifest='manifest'
+container=0
 
 scripts=()  # scripts to run before creating the .aci file
 
@@ -333,6 +334,8 @@ done
 # shift optional args
 shift $(($OPTIND-1))
 
+[ $1 = 'container' ] && container=1 && shift
+
 command=$1
 image=$2
 shift 2
@@ -345,7 +348,7 @@ if [ $? -ne 0 ]; then
     die "actool is not installed"
 fi
 
-if [ $command = 'container' ]; then
+if [ $container -eq 1 ]; then
     rocket_verify_manifest $manifest
     rocket_verify_imagename $image $force
     verify_packages ${all_packages}
@@ -363,7 +366,7 @@ if [ $command = 'container' ]; then
         script_flag=("${script_flag[@]}" -s $script)
     done
 
-    _runasroot systemd-nspawn -D "$WORKDIR" /usr/bin/tinyrocket rocket ${script_flag} ${image} ${all_packages}
+    _runasroot systemd-nspawn -D "$WORKDIR" /usr/bin/tinyrocket ${script_flag} ${command} ${image} ${all_packages}
     cp "${WORKDIR}"/$image ./$image
 
 elif [ $command = 'rocket' ]; then
