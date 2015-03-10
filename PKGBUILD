@@ -7,7 +7,7 @@ arch=('x86_64')
 license=('GPL')
 depends=('zsh' 'pacman' 'systemd')
 source=('tinyrocket' 'tinybuild')
-md5sums=('6483bc1fba6c9bdbb1b7483a79f68dfc'
+md5sums=('b7ee13da56f4ef63f1a35b14601a3ac2'
          '249a6434e6c8472a2307f000a41ba410')
 
 package() {

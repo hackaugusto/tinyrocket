@@ -65,7 +65,7 @@ die() {
 }
 
 usage() {
-    die "$0 [-f] [-m <manifest file>] (container|aci) <image_name> <package>..."
+    die "$0 [-f] [-m <manifest file>] (container|aci|docker) <image_name> <package>..."
 }
 
 cleanup() {
@@ -148,7 +148,7 @@ verify_packages() {
     [ ! $? -eq 0 ] && die "Unknow packages"
 }
 
-verify_imagename() {
+rocket_verify_imagename() {
     local image force
 
     [ $# -ne 2 ] && die "${0} requires two arguments: ${0} [image name] [force]"
@@ -170,7 +170,7 @@ verify_imagename() {
     fi
 }
 
-verify_manifest() {
+rocket_verify_manifest() {
     local manifest
 
     [ $# -ne 1 ] && die "${0} requires one argument, $# informed: ${0} [manifest file]"
@@ -213,39 +213,35 @@ container() {
 }
 
 build() {
-    local packages_install directory rootfs image_name
+    local packages_install directory image_name
 
     [ $# -lt 4 ] && die "${0} requires at least four arguments, $# informed ($@): ${0} [directory] [image name] [scripts] [package]..."
     [ -e $1 -a ! -d $1 ] && die "${1} should be a directory"
     [ ! -e $1 ] && mkdir -p $1
 
     directory=$1
-    rootfs="${directory}/rootfs"
     image_name=$2
     scripts=(${(s. .)3})
     shift 3
 
-    msg "Starting the build"
+    msg "Starting the rocket build"
 
     info "filesystem directories"
-    filesystem $rootfs
+    filesystem $directory
 
     packages_install="${@[*]}"
     info "pacman [installing ${#@}: $packages_install]"
-    packages $rootfs $@
+    packages $directory $@
 
     for script in $scripts; do
         msg "running script ${script}"
-        cp $script $rootfs/tmp
-        chroot $rootfs zsh tmp/$script
-        rm $rootfs/tmp/$script
+        cp $script $directory/tmp
+        chroot $directory zsh tmp/$script
+        rm $directory/tmp/$script
     done
 
     info "cleanup the image"
-    image_precleanup $rootfs
-
-    info "generating the aci"
-    image $directory $image_name
+    image_precleanup $directory
 }
 
 filesystem() {
@@ -281,7 +277,7 @@ packages() {
     [ ! $? -eq 0 ] && die "pacman failed"
 }
 
-image() {
+rocket_image() {
     local directory image_name
 
     [ $# -ne 2 ] && die "${0} requires two arguments: ${0} [directory] [image name]"
@@ -292,7 +288,17 @@ image() {
     _runasroot chmod 644 $image_name
 }
 
-# [container|aci] [image name] [package]
+docker_image() {
+    local directory image_name
+
+    [ $# -ne 2 ] && die "${0} requires two arguments, $# given ($@): ${0} [directory] [image name]"
+    directory=$1
+    image_name=$2
+
+    _runasroot tar --directory=$directory -cf $image_name .
+}
+
+# [container|rocket|docker] [image name] [package]
 [ $# -lt 3 ] && error 'missing arguments' && usage
 
 force=0
@@ -340,8 +346,8 @@ if [ $? -ne 0 ]; then
 fi
 
 if [ $command = 'container' ]; then
-    verify_manifest $manifest
-    verify_imagename $image $force
+    rocket_verify_manifest $manifest
+    rocket_verify_imagename $image $force
     verify_packages ${all_packages}
 
     WORKDIR=$(mktemp -d --suffix 'tinyrocket.container')
@@ -357,21 +363,34 @@ if [ $command = 'container' ]; then
         script_flag=("${script_flag[@]}" -s $script)
     done
 
-    _runasroot systemd-nspawn -D "$WORKDIR" /usr/bin/tinyrocket aci ${script_flag} ${image} ${all_packages}
+    _runasroot systemd-nspawn -D "$WORKDIR" /usr/bin/tinyrocket rocket ${script_flag} ${image} ${all_packages}
     cp "${WORKDIR}"/$image ./$image
 
-elif [ $command = 'aci' ]; then
+elif [ $command = 'rocket' ]; then
     all_packages=($IMAGE_PACKAGES ${all_packages})
 
-    verify_manifest $manifest
-    verify_imagename $image $force
+    rocket_verify_manifest $manifest
+    rocket_verify_imagename $image $force
     verify_packages ${all_packages}
 
-    WORKDIR=$(mktemp -d --suffix 'tinyrocket.aci')
+    WORKDIR=$(mktemp -d --suffix 'tinyrocket.rotcket')
+    ROOTFS="${WORKDIR}/rootfs"
 
     cp $manifest $WORKDIR/manifest
+    build $ROOTFS $image "$scripts" $all_packages
+
+    info "generating the aci"
+    rocket_image $WORKDIR $image
+elif [ $command = 'docker' ]; then
+    all_packages=($IMAGE_PACKAGES ${all_packages})
+
+    WORKDIR=$(mktemp -d --suffix 'tinyrocket.docker')
+
+    verify_packages ${all_packages}
     build $WORKDIR $image "$scripts" $all_packages
+
+    docker_image $WORKDIR $image
 else
-    error 'command must be container or aci'
+    error "unknow command ${command}"
     usage
 fi
